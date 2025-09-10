@@ -12,9 +12,9 @@ export async function scanDomain(domain: string, timeoutMs = 8000) {
 
   const records = await dns.lookup(domain, { all: true });
   const addresses = [
-    ...records.filter(r => r.family === 4),
-    ...records.filter(r => r.family === 6),
-  ].map(r => r.address);
+    ...records.filter((r) => r.family === 4),
+    ...records.filter((r) => r.family === 6),
+  ].map((r) => r.address);
   if (!addresses.length) throw new Error("No A/AAAA records");
 
   let lastErr: any;
@@ -33,7 +33,7 @@ function connectOnce(domain: string, ip: string, timeoutMs: number) {
     const sock = tls.connect({
       host: ip,
       port: 443,
-      servername: domain,
+      servername: domain, // SNI
       ALPNProtocols: ["h2", "http/1.1"],
     });
 
@@ -42,13 +42,12 @@ function connectOnce(domain: string, ip: string, timeoutMs: number) {
     sock.once("secureConnect", () => {
       clearTimeout(t);
 
-      const tlsVersion = sock.getProtocol();           // e.g., "TLSv1.3"
-      // @ts-ignore (exists at runtime)
-      const alpn = sock.alpnProtocol || null;
+      const tlsVersion = sock.getProtocol(); // e.g., "TLSv1.3"
+      // Node typings don’t declare alpnProtocol; it exists at runtime
+      const alpn: string | null = (sock as any).alpnProtocol || null;
       const cipherSuite = sock.getCipher()?.name || null;
 
       const peer = sock.getPeerCertificate(true);
-      // raw DER buffer is available only when true is passed
       const raw: Buffer | undefined = (peer as any).raw;
 
       let cn: string | null = null;
@@ -68,35 +67,48 @@ function connectOnce(domain: string, ip: string, timeoutMs: number) {
           issuer = x.issuer || null;
           notBefore = x.validFrom ? new Date(x.validFrom).toISOString() : null;
           notAfter = x.validTo ? new Date(x.validTo).toISOString() : null;
-          signatureAlgorithm = x.signatureAlgorithm || null;
 
+          // Subject CN + SANs
           cn = /CN=([^,]+)/.exec(x.subject)?.[1] || null;
           const sanStr = x.subjectAltName || "";
           san = sanStr
             .split(",")
-            .map(s => s.trim())
-            .filter(s => s.startsWith("DNS:"))
-            .map(s => s.slice(4));
+            .map((s) => s.trim())
+            .filter((s) => s.startsWith("DNS:"))
+            .map((s) => s.slice(4));
 
-          const pk = x.publicKey as any;
-          const ktype = pk?.asymmetricKeyType;
+          // Typings omission: access via 'any' at runtime; fallback to peer summary
+          signatureAlgorithm =
+            ((x as any).signatureAlgorithm as string | undefined) ??
+            ((peer as any).signatureAlgorithm as string | undefined) ??
+            null;
+
+          // Public key details
+          const pk = (x as any).publicKey;
+          const ktype = pk?.asymmetricKeyType as string | undefined;
           if (ktype === "rsa") {
             keyType = "rsa";
             keyBitsOrCurve = String(pk?.asymmetricKeyDetails?.modulusLength ?? "");
           } else if (ktype === "ec") {
             keyType = "ec";
             keyBitsOrCurve = pk?.asymmetricKeyDetails?.namedCurve ?? null;
-          } else if (ktype === "ed25519") keyType = "ed25519";
-          else if (ktype === "ed448") keyType = "ed448";
+          } else if (ktype === "ed25519") {
+            keyType = "ed25519";
+          } else if (ktype === "ed448") {
+            keyType = "ed448";
+          } else {
+            keyType = "unknown";
+          }
         } else {
-          // fallback (less detailed)
+          // Fallback if no raw cert
           cn = peer.subject?.CN ?? null;
           issuer = peer.issuer?.CN ?? null;
           notBefore = peer.valid_from ? new Date(peer.valid_from).toISOString() : null;
           notAfter = peer.valid_to ? new Date(peer.valid_to).toISOString() : null;
+          signatureAlgorithm = (peer as any).signatureAlgorithm ?? null;
         }
-      } catch (_) {
-        // continue with whatever we have
+      } catch {
+        // continue with partial data
       } finally {
         sock.end();
       }
