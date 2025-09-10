@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: cipherwyze-tls-scanner
+    env: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: SCANNER_API_KEY
+        sync: false
