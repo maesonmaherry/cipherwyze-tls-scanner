@@ -1,77 +1,54 @@
 import tls from "tls";
 import dns from "dns/promises";
 import { X509Certificate } from "crypto";
-import type { TlsScanResult } from "./types.js";
 
 const isAsciiHostname = (host: string) =>
   /^[A-Za-z0-9.-]{1,255}$/.test(host) &&
-  !/^\d{1,3}(\.\d{1,3}){3}$/.test(host) && // no IPv4
-  !/^[0-9a-f:]+$/i.test(host); // no IPv6
+  !/^\d{1,3}(\.\d{1,3}){3}$/.test(host) &&
+  !/^[0-9a-f:]+$/i.test(host);
 
-export async function scanTls(domain: string, timeoutMs = 8000): Promise<TlsScanResult> {
-  if (!isAsciiHostname(domain)) {
-    throw Object.assign(new Error("Invalid domain"), { status: 400 });
-  }
+export async function scanDomain(domain: string, timeoutMs = 8000) {
+  if (!isAsciiHostname(domain)) throw new Error("Invalid domain");
 
-  const addrs = await dns.lookup(domain, { all: true }).catch((e) => {
-    const err = new Error(`DNS lookup failed: ${e.message}`);
-    (err as any).status = 502;
-    throw err;
-  });
+  const records = await dns.lookup(domain, { all: true });
+  const addresses = [
+    ...records.filter(r => r.family === 4),
+    ...records.filter(r => r.family === 6),
+  ].map(r => r.address);
+  if (!addresses.length) throw new Error("No A/AAAA records");
 
-  // Prefer IPv4 first to reduce IPv6 edge issues; then IPv6
-  const sorted = [
-    ...addrs.filter((a) => a.family === 4),
-    ...addrs.filter((a) => a.family === 6),
-  ];
-  if (sorted.length === 0) {
-    throw Object.assign(new Error("No A/AAAA records"), { status: 502 });
-  }
-
-  const resolvedIPs = sorted.map((a) => a.address);
-  const scannedAt = new Date().toISOString();
-
-  // Try addresses in order until one succeeds
   let lastErr: any;
-  for (const ip of resolvedIPs) {
+  for (const ip of addresses) {
     try {
-      const result = await connectOnce(domain, ip, timeoutMs);
-      return { ...result, resolvedIPs, scannedAt };
-    } catch (e: any) {
+      return await connectOnce(domain, ip, timeoutMs);
+    } catch (e) {
       lastErr = e;
-      continue;
     }
   }
-  const err = new Error(lastErr?.message || "TLS connect failed");
-  (err as any).status = lastErr?.status || 502;
-  throw err;
+  throw lastErr || new Error("TLS connection failed");
 }
 
-async function connectOnce(domain: string, ip: string, timeoutMs: number) {
-  return new Promise<TlsScanResult>((resolve, reject) => {
-    const socket = tls.connect({
+function connectOnce(domain: string, ip: string, timeoutMs: number) {
+  return new Promise((resolve, reject) => {
+    const sock = tls.connect({
       host: ip,
       port: 443,
-      servername: domain, // SNI
-      ALPNProtocols: ["h2", "http/1.1"]
+      servername: domain,
+      ALPNProtocols: ["h2", "http/1.1"],
     });
 
-    const onTimeout = () => {
-      socket.destroy(new Error("timeout"));
-    };
-    const timeoutHandle = setTimeout(onTimeout, timeoutMs);
+    const t = setTimeout(() => sock.destroy(new Error("timeout")), timeoutMs);
 
-    socket.once("secureConnect", () => {
-      clearTimeout(timeoutHandle);
+    sock.once("secureConnect", () => {
+      clearTimeout(t);
 
-      const tlsVersion = socket.getProtocol(); // e.g., TLSv1.3
-      // @ts-expect-error Node typings lag: alpnProtocol is there at runtime
-      const alpn: string | null = (socket as any).alpnProtocol || null;
-      const cipherObj = socket.getCipher();
-      const cipherSuite = cipherObj?.name || null;
+      const tlsVersion = sock.getProtocol();           // e.g., "TLSv1.3"
+      // @ts-ignore (exists at runtime)
+      const alpn = sock.alpnProtocol || null;
+      const cipherSuite = sock.getCipher()?.name || null;
 
-      const peer = socket.getPeerCertificate(true);
-      // 'raw' is available when passing 'true' to getPeerCertificate
+      const peer = sock.getPeerCertificate(true);
+      // raw DER buffer is available only when true is passed
       const raw: Buffer | undefined = (peer as any).raw;
 
       let cn: string | null = null;
@@ -93,49 +70,44 @@ async function connectOnce(domain: string, ip: string, timeoutMs: number) {
           notAfter = x.validTo ? new Date(x.validTo).toISOString() : null;
           signatureAlgorithm = x.signatureAlgorithm || null;
 
-          // Subject CN and SAN parsing
-          cn = extractCN(x.subject) || null;
-          san = extractSANs(x) || [];
-          // Public key
-          const pk = x.publicKey;
-          // @ts-ignore: Node publicKey.asymmetricKeyType exists
-          const ktype: string | undefined = (pk as any).asymmetricKeyType;
+          cn = /CN=([^,]+)/.exec(x.subject)?.[1] || null;
+          const sanStr = x.subjectAltName || "";
+          san = sanStr
+            .split(",")
+            .map(s => s.trim())
+            .filter(s => s.startsWith("DNS:"))
+            .map(s => s.slice(4));
+
+          const pk = x.publicKey as any;
+          const ktype = pk?.asymmetricKeyType;
           if (ktype === "rsa") {
             keyType = "rsa";
-            // @ts-ignore
-            keyBitsOrCurve = String((pk as any).asymmetricKeyDetails?.modulusLength ?? "");
+            keyBitsOrCurve = String(pk?.asymmetricKeyDetails?.modulusLength ?? "");
           } else if (ktype === "ec") {
             keyType = "ec";
-            // @ts-ignore
-            keyBitsOrCurve = (pk as any).asymmetricKeyDetails?.namedCurve ?? null;
-          } else if (ktype === "ed25519") {
-            keyType = "ed25519";
-          } else if (ktype === "ed448") {
-            keyType = "ed448";
-          } else {
-            keyType = "unknown";
-          }
+            keyBitsOrCurve = pk?.asymmetricKeyDetails?.namedCurve ?? null;
+          } else if (ktype === "ed25519") keyType = "ed25519";
+          else if (ktype === "ed448") keyType = "ed448";
         } else {
-          // Fallback to parsed strings from getPeerCertificate summary
+          // fallback (less detailed)
           cn = peer.subject?.CN ?? null;
           issuer = peer.issuer?.CN ?? null;
           notBefore = peer.valid_from ? new Date(peer.valid_from).toISOString() : null;
           notAfter = peer.valid_to ? new Date(peer.valid_to).toISOString() : null;
         }
-      } catch (e) {
-        // continue with partial data
+      } catch (_) {
+        // continue with whatever we have
       } finally {
-        socket.end();
+        sock.end();
       }
 
-      const tls_ok = !!tlsVersion && (tlsVersion === "TLSv1.3" || tlsVersion === "TLSv1.2");
+      const tls_ok = tlsVersion === "TLSv1.3" || tlsVersion === "TLSv1.2";
       const weak_alg =
         (keyType === "rsa" && (Number(keyBitsOrCurve) || 0) < 2048) ||
         (signatureAlgorithm || "").toLowerCase().includes("sha1") ||
         (cipherSuite || "").toUpperCase().includes("RC4") ||
         (cipherSuite || "").toUpperCase().includes("3DES");
-      const pqc_ready: "no" | "partial" | "unknown" =
-        keyType === "ec" || keyType === "rsa" ? "no" : "unknown";
+      const pqc_ready = keyType === "rsa" || keyType === "ec" ? "no" : "unknown";
 
       resolve({
         domain,
@@ -152,38 +124,16 @@ async function connectOnce(domain: string, ip: string, timeoutMs: number) {
           signatureAlgorithm,
           keyType,
           keyBitsOrCurve,
-          fingerprint256
+          fingerprint256,
         },
         posture: { tls_ok, weak_alg, pqc_ready },
-        scannedAt: new Date().toISOString()
+        scannedAt: new Date().toISOString(),
       });
     });
 
-    socket.once("error", (e) => {
-      clearTimeout(timeoutHandle);
-      const err: any = new Error(`TLS error: ${e.message}`);
-      err.status = /timeout/i.test(e.message) ? 504 : 502;
-      reject(err);
+    sock.once("error", (e) => {
+      clearTimeout(t);
+      reject(e);
     });
   });
-}
-
-function extractCN(subject: string): string | null {
-  // subject like "CN=example.com,O=...,C=.."
-  const m = /CN=([^,]+)/.exec(subject);
-  return m ? m[1] : null;
-}
-
-function extractSANs(x: X509Certificate): string[] {
-  try {
-    const ext = x.subjectAltName; // "DNS:example.com, DNS:www.example.com"
-    if (!ext) return [];
-    return ext
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => s.startsWith("DNS:"))
-      .map((s) => s.slice(4));
-  } catch {
-    return [];
-  }
 }
