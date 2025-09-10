@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import { scanDomain } from "./scan";
+import { scanDomain } from "./scan.js";
 
 const app = express();
 app.use(express.json());
